@@ -18,37 +18,13 @@ To solve these issues, our architecture completely abandons extractive tagging. 
 ## 2. Model Pipeline Flowchart
 
 ```mermaid
-flowchart TD
-    %% Define styles
-    classDef inputStyle fill:#f9f9f9,stroke:#333,stroke-width:2px,color:#000
-    classDef modelStyle fill:#d4ebf2,stroke:#007acc,stroke-width:2px,color:#000
-    classDef processStyle fill:#e6f3ff,stroke:#005c99,stroke-width:1px,color:#000
-    classDef outputStyle fill:#e6ffe6,stroke:#00b300,stroke-width:2px,color:#000
-
-    %% Nodes
-    A["Raw Input Text:\n'the battery is great but the screen is too small'"]:::inputStyle
-    B["Prefix Addition:\n'extract aspect opinion sentiment: ...'"]:::processStyle
-    C["Tokenization (SentencePiece)"]:::processStyle
-    
-    subgraph T5 ["T5-small (Seq2Seq Model)"]
-        direction TB
-        E["Bi-directional Encoder\n(Creates Contextual Embeddings)"]:::processStyle
-        F["Autoregressive Decoder\n(Cross-Attention & Beam Search)"]:::processStyle
-        E --> F
-    end
-    
-    G["Raw Text Output:\n'( battery | great | 8.5 | 6.2 ) ; ( screen | too small | 2.5 | 6.5 )'"]:::processStyle
-    H["String Parsing\n(Splitting by ';' and '|')"]:::processStyle
-    I["Final JSON Structure:\n[{'Aspect': 'battery', ...}, ...]"]:::outputStyle
-
-    %% Connections
-    A --> B
-    B --> C
-    C --> T5
-    
-    T5 --> G
-    G --> H
-    H --> I
+graph TD
+    A[Raw Input Text] --> B[Prefix Addition: extract aspect opinion sentiment...]
+    B --> C[Tokenization via SentencePiece]
+    C --> D[T5-small Seq2Seq Model: Bi-directional Encoder + Decoder]
+    D --> E[Raw Text Output]
+    E --> F[String Parsing: Splitting by semicolon and pipe]
+    F --> G[Final JSON Structure: Aspect / Opinion / VA]
 ```
 
 ---
