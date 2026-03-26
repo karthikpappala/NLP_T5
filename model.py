@@ -1,194 +1,106 @@
 """
 model.py
-Architecture: ModernBERT encoder → GCN layers → Span classifier + VA regressor
+T5-based Aspect Sentiment Triplet Extraction (ASTE) model.
 
-ModernBERT (answerdotai/ModernBERT-base)
-    ↓  [B, seq, H]
-GCN (2 layers, residual)
-    ↓  [B, seq, H]
-Span classifier head  → token-level BIO logits  [B, seq, 5]
-VA regressor head     → mean-pooled → [valence, arousal]  [B, 2]
+Uses T5ForConditionalGeneration to directly generate structured triplets
+from input text in a seq2seq fashion.
+
+Input:  "extract aspect opinion sentiment: <sentence>"
+Output: "( aspect | opinion | valence | arousal ) ; ( ... )"
 """
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from transformers import AutoModel
-
-from data_loader import NUM_SPAN_LABELS
+from transformers import T5ForConditionalGeneration, T5Tokenizer
 
 
-# ── Graph Convolutional Layer ────────────────────────────────────────────────
-
-class GCNLayer(nn.Module):
+class ASTEModel:
     """
-    Single GCN layer:  H' = ReLU( D^{-1} A H W )
-    Adjacency A is passed pre-normalised from the data loader.
+    Thin wrapper around T5ForConditionalGeneration.
+    Provides consistent interface for training and inference.
     """
-
-    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.linear  = nn.Linear(in_dim, out_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.norm    = nn.LayerNorm(out_dim)
-
-    def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-        """
-        h   : [B, seq, in_dim]
-        adj : [B, seq, seq]  (row-normalised)
-        """
-        support = self.linear(h)                    # [B, seq, out_dim]
-        agg     = torch.bmm(adj, support)           # [B, seq, out_dim]
-        out     = F.relu(agg)
-        out     = self.dropout(out)
-        out     = self.norm(out)
-        return out
-
-
-# ── Full ASTE model ──────────────────────────────────────────────────────────
-
-class ASTEModel(nn.Module):
 
     def __init__(
         self,
-        encoder_name: str  = "answerdotai/ModernBERT-base",
-        gcn_layers: int    = 2,
-        gcn_dropout: float = 0.1,
-        span_dropout: float = 0.2,
-        va_dropout: float   = 0.2,
-        freeze_encoder_layers: int = 0,   # 0 = fine-tune all
+        model_name: str = "google-t5/t5-base",
+        max_target_len: int = 256,
     ):
-        super().__init__()
+        self.model = T5ForConditionalGeneration.from_pretrained(model_name)
+        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
+        self.max_target_len = max_target_len
 
-        # ── Encoder ──────────────────────────────────────────────────────────
-        self.encoder = AutoModel.from_pretrained(encoder_name)
-        hidden_size  = self.encoder.config.hidden_size   # 768 for base
+    def to(self, device):
+        self.model = self.model.to(device)
+        return self
 
-        # Optionally freeze early transformer layers
-        if freeze_encoder_layers > 0:
-            for i, layer in enumerate(self.encoder.encoder.layers):
-                if i < freeze_encoder_layers:
-                    for p in layer.parameters():
-                        p.requires_grad = False
+    def train(self):
+        self.model.train()
 
-        # ── GCN ──────────────────────────────────────────────────────────────
-        self.gcn_layers = nn.ModuleList()
-        in_dim = hidden_size
-        for _ in range(gcn_layers):
-            self.gcn_layers.append(GCNLayer(in_dim, hidden_size, dropout=gcn_dropout))
-            in_dim = hidden_size
+    def eval(self):
+        self.model.eval()
 
-        # Residual projection (if dims differ; here they're equal → identity)
-        self.gcn_proj = nn.Linear(hidden_size, hidden_size)
+    def parameters(self):
+        return self.model.parameters()
 
-        # ── Span classifier head ──────────────────────────────────────────────
-        self.span_dropout  = nn.Dropout(span_dropout)
-        self.span_classifier = nn.Linear(hidden_size, NUM_SPAN_LABELS)
+    def state_dict(self):
+        return self.model.state_dict()
 
-        # ── VA regression head ────────────────────────────────────────────────
-        self.va_dropout  = nn.Dropout(va_dropout)
-        self.va_regressor = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(va_dropout),
-            nn.Linear(hidden_size // 2, 2),     # → [valence, arousal]
-            nn.Sigmoid(),                        # map to [0, 1]; scale to [1, 9] at inference
-        )
+    def load_state_dict(self, state_dict):
+        self.model.load_state_dict(state_dict)
 
-    # ── Forward ───────────────────────────────────────────────────────────────
-
-    def forward(
-        self,
-        input_ids:      torch.Tensor,
-        attention_mask: torch.Tensor,
-        adj:            torch.Tensor,
-    ):
+    def forward(self, input_ids, attention_mask, labels=None):
         """
-        Returns
-        -------
-        span_logits : [B, seq, NUM_SPAN_LABELS]
-        va_pred     : [B, 2]   values in [1, 9]
+        Forward pass for training.
+        Returns loss when labels are provided.
         """
-        # Encoder
-        enc_out = self.encoder(
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            labels=labels,
         )
-        h = enc_out.last_hidden_state   # [B, seq, H]
+        return outputs
 
-        # GCN with residual
-        gcn_in = h
-        for layer in self.gcn_layers:
-            gcn_out = layer(gcn_in, adj)
-            gcn_in  = gcn_out + self.gcn_proj(gcn_in)   # residual
-
-        h_gcn = gcn_in  # [B, seq, H]
-
-        # Span logits (token level)
-        span_logits = self.span_classifier(self.span_dropout(h_gcn))  # [B, seq, 5]
-
-        # VA prediction (mean pool over non-padding tokens)
-        mask_expanded = attention_mask.unsqueeze(-1).float()           # [B, seq, 1]
-        pooled = (h_gcn * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-9)
-        va_raw = self.va_regressor(self.va_dropout(pooled))            # [B, 2] in [0,1]
-        va_pred = va_raw * 8.0 + 1.0                                   # scale to [1, 9]
-
-        return span_logits, va_pred
-
-
-# ── Loss function ─────────────────────────────────────────────────────────────
-
-class ASTELoss(nn.Module):
-    """
-    Combined loss:
-      L = λ_span * CE(span, weighted) + λ_va * MSE(VA)
-
-    Class weights upweight B/I span labels vs O to fight token imbalance
-    (~81% of tokens are O, causing the model to predict O for everything).
-    """
-
-    def __init__(self, lambda_span: float = 1.0, lambda_va: float = 0.3,
-                 span_class_weights: list = None, device: str = "cpu"):
-        super().__init__()
-        self.lambda_span = lambda_span
-        self.lambda_va   = lambda_va
-
-        # Default weights: O=1.0, B-ASP=5.0, I-ASP=4.0, B-OPN=5.0, I-OPN=4.0
-        if span_class_weights is None:
-            span_class_weights = [1.0, 5.0, 4.0, 5.0, 4.0]
-        weights = torch.tensor(span_class_weights, dtype=torch.float)
-        self.ce_loss  = nn.CrossEntropyLoss(ignore_index=-100, weight=weights)
-        self.mse_loss = nn.MSELoss()
-
-    def forward(
-        self,
-        span_logits: torch.Tensor,   # [B, seq, 5]
-        va_pred:     torch.Tensor,   # [B, 2]
-        span_labels: torch.Tensor,   # [B, seq]
-        valence:     torch.Tensor,   # [B]
-        arousal:     torch.Tensor,   # [B]
-    ):
-        # Span classification loss
-        B, S, C = span_logits.shape
-        span_loss = self.ce_loss(
-            span_logits.view(B * S, C),
-            span_labels.view(B * S),
+    @torch.no_grad()
+    def generate(self, input_ids, attention_mask, num_beams=4):
+        """
+        Generate triplet text for inference.
+        """
+        outputs = self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_length=self.max_target_len,
+            num_beams=num_beams,
+            early_stopping=True,
+            no_repeat_ngram_size=0,
         )
+        return outputs
 
-        # VA regression loss
-        va_target = torch.stack([valence, arousal], dim=1)  # [B, 2]
-        va_loss   = self.mse_loss(va_pred, va_target)
+    def decode(self, token_ids):
+        """Decode token IDs to text."""
+        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
-        total = self.lambda_span * span_loss + self.lambda_va * va_loss
-        return total, span_loss, va_loss
+    def batch_decode(self, token_ids):
+        """Decode batch of token IDs to list of strings."""
+        return self.tokenizer.batch_decode(token_ids, skip_special_tokens=True)
 
 
 if __name__ == "__main__":
     model = ASTEModel()
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    B, S = 2, 128
-    ids   = torch.randint(0, 1000, (B, S))
-    mask  = torch.ones(B, S, dtype=torch.long)
-    adj   = torch.eye(S).unsqueeze(0).expand(B, -1, -1)
-    sl, va = model(ids, mask, adj)
-    print(f"span_logits: {sl.shape}, va_pred: {va.shape}")
+
+    # Smoke test
+    tokenizer = model.tokenizer
+    text = "extract aspect opinion sentiment: The food was great but service was slow."
+    enc = tokenizer(text, return_tensors="pt", max_length=128, truncation=True, padding="max_length")
+
+    # Training forward pass
+    target = "( food | great | 7.50 | 6.00 ) ; ( service | slow | 3.00 | 5.50 )"
+    tgt_enc = tokenizer(target, return_tensors="pt", max_length=256, truncation=True, padding="max_length")
+    labels = tgt_enc["input_ids"]
+    labels[labels == tokenizer.pad_token_id] = -100
+
+    outputs = model.forward(enc["input_ids"], enc["attention_mask"], labels=labels)
+    print(f"Loss: {outputs.loss.item():.4f}")
+
+    # Generation
+    gen_ids = model.generate(enc["input_ids"], enc["attention_mask"])
+    print(f"Generated: {model.decode(gen_ids[0])}")

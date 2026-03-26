@@ -1,166 +1,100 @@
 """
 data_loader.py
-Loads merged_train.jsonl, builds token-level BIO labels for aspect & opinion spans,
-constructs spaCy dependency graphs, and returns PyTorch DataLoader objects.
+T5 seq2seq data loader for ASTE.
 
-Label scheme
-------------
-B-ASP / I-ASP  – aspect span
-B-OPN / I-OPN  – opinion span
-O              – outside
-NULL_SPAN      – token belongs to a NULL aspect/opinion (no span to extract)
+Input:  "Extract aspect-opinion-sentiment triplets: <sentence>"
+Target: "( aspect | opinion | valence | arousal ) ; ( ... )"
+
+Handles NULL aspects/opinions as literal "NULL" strings.
 """
 
 import json
-import re
-from collections import defaultdict
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple
 
-import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
-import spacy
+from transformers import T5Tokenizer
 
 # ── constants ───────────────────────────────────────────────────────────────
-LABEL2ID = {"O": 0, "B-ASP": 1, "I-ASP": 2, "B-OPN": 3, "I-OPN": 4}
-ID2LABEL = {v: k for k, v in LABEL2ID.items()}
-NUM_SPAN_LABELS = len(LABEL2ID)
-
-NULL_VALENCE  = 5.0
-NULL_AROUSAL  = 5.0
-MAX_SEQ_LEN   = 128
-PAD_LABEL_ID  = -100      # ignored by CrossEntropyLoss
+MAX_INPUT_LEN  = 128
+MAX_TARGET_LEN = 256
+PREFIX = "extract aspect opinion sentiment: "
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _find_span_positions(text: str, phrase: str) -> Optional[Tuple[int, int]]:
-    """Return (start_char, end_char) of first occurrence of phrase in text."""
-    if not phrase or phrase == "NULL":
-        return None
-    m = re.search(re.escape(phrase), text, re.IGNORECASE)
-    return (m.start(), m.end()) if m else None
+def format_triplets(quadruplets: list) -> str:
+    """Convert list of quadruplet dicts to linearised target string."""
+    parts = []
+    for q in quadruplets:
+        asp = q.get("Aspect", "NULL") or "NULL"
+        opn = q.get("Opinion", "NULL") or "NULL"
+        va  = q["VA"]
+        v, a = va.split("#")
+        parts.append(f"( {asp} | {opn} | {v} | {a} )")
+    return " ; ".join(parts)
 
 
-def _char_to_token_span(offset_mapping, start_char, end_char):
-    """Map character offsets to token indices using the tokenizer's offset_mapping."""
-    tok_start, tok_end = None, None
-    for idx, (cs, ce) in enumerate(offset_mapping):
-        if cs == 0 and ce == 0:   # special token
+def parse_triplets(text: str) -> list:
+    """Parse linearised triplet string back into list of dicts.
+    Returns list of {"Aspect": ..., "Opinion": ..., "VA": "V#A"}
+    """
+    triplets = []
+    # Split on ; then parse each ( ... )
+    raw_parts = text.split(";")
+    for part in raw_parts:
+        part = part.strip()
+        if not part:
             continue
-        if tok_start is None and cs >= start_char:
-            tok_start = idx
-        if ce <= end_char:
-            tok_end = idx
-    return tok_start, tok_end
-
-
-def build_bio_labels(offset_mapping, text, aspect, opinion):
-    """
-    Build per-token BIO label array aligned with tokenizer output.
-    Returns list of int label ids.
-    """
-    n = len(offset_mapping)
-    labels = [PAD_LABEL_ID] * n   # default → ignored (special tokens keep this)
-
-    # Mark real tokens as O first
-    for idx, (cs, ce) in enumerate(offset_mapping):
-        if cs == 0 and ce == 0:
-            continue
-        labels[idx] = LABEL2ID["O"]
-
-    # Aspect span
-    asp_pos = _find_span_positions(text, aspect)
-    if asp_pos:
-        ts, te = _char_to_token_span(offset_mapping, asp_pos[0], asp_pos[1])
-        if ts is not None and te is not None:
-            labels[ts] = LABEL2ID["B-ASP"]
-            for i in range(ts + 1, te + 1):
-                labels[i] = LABEL2ID["I-ASP"]
-
-    # Opinion span
-    opn_pos = _find_span_positions(text, opinion)
-    if opn_pos:
-        ts, te = _char_to_token_span(offset_mapping, opn_pos[0], opn_pos[1])
-        if ts is not None and te is not None:
-            labels[ts] = LABEL2ID["B-OPN"]
-            for i in range(ts + 1, te + 1):
-                labels[i] = LABEL2ID["I-OPN"]
-
-    return labels
-
-
-# ── spaCy dependency graph ───────────────────────────────────────────────────
-
-def build_dep_graph(text: str, nlp, offset_mapping):
-    """
-    Build adjacency matrix [seq_len × seq_len] from spaCy dependency tree.
-    Each spaCy token is mapped to the corresponding sub-word token indices.
-    Self-loops included.
-    """
-    seq_len = len(offset_mapping)
-    adj = np.zeros((seq_len, seq_len), dtype=np.float32)
-
-    try:
-        doc = nlp(text)
-    except Exception:
-        # fallback: identity matrix
-        np.fill_diagonal(adj, 1.0)
-        return adj
-
-    # Map each spaCy token's char span to the FIRST sub-word token index
-    spacy_to_tok = {}
-    for spacy_tok in doc:
-        cs, ce = spacy_tok.idx, spacy_tok.idx + len(spacy_tok.text)
-        for t_idx, (ts, te) in enumerate(offset_mapping):
-            if ts == 0 and te == 0:
-                continue
-            if ts >= cs and te <= ce:
-                if spacy_tok.i not in spacy_to_tok:
-                    spacy_to_tok[spacy_tok.i] = t_idx
-                break
-
-    # Add edges (undirected)
-    for spacy_tok in doc:
-        head = spacy_tok.head
-        t1 = spacy_to_tok.get(spacy_tok.i)
-        t2 = spacy_to_tok.get(head.i)
-        if t1 is not None and t2 is not None:
-            adj[t1][t2] = 1.0
-            adj[t2][t1] = 1.0
-
-    # Self-loops
-    np.fill_diagonal(adj, 1.0)
-
-    # Row-normalize (D^{-1} A)
-    row_sums = adj.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1.0
-    adj = adj / row_sums
-
-    return adj
+        # Remove parens
+        part = part.strip("() ")
+        fields = [f.strip() for f in part.split("|")]
+        if len(fields) >= 4:
+            asp = fields[0] if fields[0] else "NULL"
+            opn = fields[1] if fields[1] else "NULL"
+            try:
+                v = float(fields[2])
+                a = float(fields[3])
+                v = max(1.0, min(9.0, round(v, 2)))
+                a = max(1.0, min(9.0, round(a, 2)))
+            except (ValueError, IndexError):
+                v, a = 5.0, 5.0
+            triplets.append({
+                "Aspect":  asp,
+                "Opinion": opn,
+                "VA":      f"{v:.2f}#{a:.2f}",
+            })
+        elif len(fields) >= 2:
+            # Partial parse — at least aspect and opinion
+            asp = fields[0] if fields[0] else "NULL"
+            opn = fields[1] if fields[1] else "NULL"
+            triplets.append({
+                "Aspect":  asp,
+                "Opinion": opn,
+                "VA":      "5.00#5.00",
+            })
+    return triplets
 
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
 
 class ASTEDataset(Dataset):
     """
-    Each item is ONE quadruplet (not one sentence).
-    Multiple quadruplets from the same sentence share the same tokenisation
-    but have different span labels and VA targets.
+    Each item is one sentence with ALL its quadruplets as the target.
+    This groups quadruplets per sentence (unlike the old per-quadruplet approach).
     """
 
     def __init__(
         self,
         jsonl_path: str,
-        tokenizer_name: str = "answerdotai/ModernBERT-base",
-        max_len: int = MAX_SEQ_LEN,
-        spacy_model: str = "en_core_web_sm",
-        use_dep_graph: bool = True,
+        tokenizer_name: str = "google-t5/t5-base",
+        max_input_len: int = MAX_INPUT_LEN,
+        max_target_len: int = MAX_TARGET_LEN,
+        is_test: bool = False,
     ):
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        self.max_len = max_len
-        self.use_dep_graph = use_dep_graph
-        self.nlp = spacy.load(spacy_model) if use_dep_graph else None
+        self.tokenizer = T5Tokenizer.from_pretrained(tokenizer_name)
+        self.max_input_len = max_input_len
+        self.max_target_len = max_target_len
+        self.is_test = is_test
 
         self.samples = []
         self._load(jsonl_path)
@@ -173,15 +107,19 @@ class ASTEDataset(Dataset):
                     continue
                 record = json.loads(line)
                 text = record["Text"]
-                for quad in record["Quadruplet"]:
-                    v, a = map(float, quad["VA"].split("#"))
+
+                if self.is_test:
                     self.samples.append({
-                        "id":      record["ID"],
-                        "text":    text,
-                        "aspect":  quad.get("Aspect", "NULL"),
-                        "opinion": quad.get("Opinion", "NULL"),
-                        "valence": v,
-                        "arousal": a,
+                        "id":     record["ID"],
+                        "text":   text,
+                        "target": "",
+                    })
+                else:
+                    target = format_triplets(record["Quadruplet"])
+                    self.samples.append({
+                        "id":     record["ID"],
+                        "text":   text,
+                        "target": target,
                     })
 
     def __len__(self):
@@ -189,42 +127,36 @@ class ASTEDataset(Dataset):
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        text    = s["text"]
-        aspect  = s["aspect"]
-        opinion = s["opinion"]
 
-        enc = self.tokenizer(
-            text,
-            max_length=self.max_len,
+        input_text = PREFIX + s["text"]
+
+        input_enc = self.tokenizer(
+            input_text,
+            max_length=self.max_input_len,
             padding="max_length",
             truncation=True,
-            return_offsets_mapping=True,
             return_tensors="pt",
         )
 
-        input_ids      = enc["input_ids"].squeeze(0)
-        attention_mask = enc["attention_mask"].squeeze(0)
-        offset_mapping = enc["offset_mapping"].squeeze(0).tolist()
-
-        # BIO labels
-        bio = build_bio_labels(offset_mapping, text, aspect, opinion)
-        bio_tensor = torch.tensor(bio, dtype=torch.long)
-
-        # Dependency adjacency matrix
-        if self.use_dep_graph and self.nlp is not None:
-            adj = build_dep_graph(text, self.nlp, offset_mapping)
-        else:
-            adj = np.eye(self.max_len, dtype=np.float32)
-        adj_tensor = torch.tensor(adj, dtype=torch.float)
-
-        return {
-            "input_ids":      input_ids,
-            "attention_mask": attention_mask,
-            "adj":            adj_tensor,
-            "span_labels":    bio_tensor,
-            "valence":        torch.tensor(s["valence"], dtype=torch.float),
-            "arousal":        torch.tensor(s["arousal"], dtype=torch.float),
+        result = {
+            "input_ids":      input_enc["input_ids"].squeeze(0),
+            "attention_mask": input_enc["attention_mask"].squeeze(0),
         }
+
+        if not self.is_test and s["target"]:
+            target_enc = self.tokenizer(
+                s["target"],
+                max_length=self.max_target_len,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            labels = target_enc["input_ids"].squeeze(0)
+            # Replace padding token id with -100 so it's ignored in loss
+            labels[labels == self.tokenizer.pad_token_id] = -100
+            result["labels"] = labels
+
+        return result
 
 
 # ── DataLoader factory ────────────────────────────────────────────────────────
@@ -232,15 +164,14 @@ class ASTEDataset(Dataset):
 def get_dataloaders(
     train_path: str,
     val_split: float = 0.1,
-    tokenizer_name: str = "answerdotai/ModernBERT-base",
-    batch_size: int = 16,
+    tokenizer_name: str = "google-t5/t5-base",
+    batch_size: int = 8,
     num_workers: int = 2,
-    use_dep_graph: bool = True,
+    **kwargs,  # accept and ignore extra args for compatibility
 ):
     full_ds = ASTEDataset(
         train_path,
         tokenizer_name=tokenizer_name,
-        use_dep_graph=use_dep_graph,
     )
 
     n_val   = int(len(full_ds) * val_split)
@@ -269,9 +200,15 @@ def get_dataloaders(
 
 
 if __name__ == "__main__":
-    print("Testing data loader …")
+    print("Testing T5 data loader …")
     tr, vl = get_dataloaders("merged_train.jsonl", batch_size=4)
     batch = next(iter(tr))
     for k, v in batch.items():
         print(f"  {k}: {v.shape}")
     print(f"Train batches: {len(tr)}, Val batches: {len(vl)}")
+
+    # Show a sample
+    ds = tr.dataset.dataset  # unwrap Subset → ASTEDataset
+    s = ds.samples[0]
+    print(f"\n  Input:  {PREFIX + s['text'][:80]}...")
+    print(f"  Target: {s['target'][:120]}...")

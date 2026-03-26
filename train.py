@@ -1,26 +1,27 @@
 """
 train.py
-Full training loop for ModernBERT + GCN ASTE model.
+Training loop for T5-based ASTE model.
 
 Usage:
     python train.py                          # defaults
-    python train.py --epochs 10 --lr 2e-5
+    python train.py --epochs 15 --lr 3e-4
 """
 
 import argparse
 import os
 import json
 import time
+import re
 from pathlib import Path
+from collections import Counter
 
 import torch
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, T5Tokenizer
 from tqdm import tqdm
 
-from data_loader import get_dataloaders, ID2LABEL, PAD_LABEL_ID
-from model import ASTEModel, ASTELoss
+from data_loader import get_dataloaders, parse_triplets
+from model import ASTEModel
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -28,181 +29,144 @@ from model import ASTEModel, ASTELoss
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data",          default="merged_train.jsonl")
-    p.add_argument("--encoder",       default="answerdotai/ModernBERT-base")
+    p.add_argument("--encoder",       default="google-t5/t5-base")
     p.add_argument("--output_dir",    default="checkpoints")
-    p.add_argument("--epochs",        type=int,   default=10)
-    p.add_argument("--batch_size",    type=int,   default=16)
-    p.add_argument("--lr",            type=float, default=2e-5)
+    p.add_argument("--epochs",        type=int,   default=15)
+    p.add_argument("--batch_size",    type=int,   default=8)
+    p.add_argument("--lr",            type=float, default=3e-4)
     p.add_argument("--warmup_ratio",  type=float, default=0.1)
     p.add_argument("--val_split",     type=float, default=0.1)
-    p.add_argument("--gcn_layers",    type=int,   default=2)
-    p.add_argument("--lambda_span",   type=float, default=1.0)
-    p.add_argument("--lambda_va",     type=float, default=0.5)
     p.add_argument("--num_workers",   type=int,   default=2)
-    p.add_argument("--no_dep_graph",  action="store_true",
-                   help="Disable spaCy dependency graph (faster, lower quality)")
     p.add_argument("--seed",          type=int,   default=42)
+    p.add_argument("--patience",      type=int,   default=5)
+    p.add_argument("--num_beams",     type=int,   default=4)
+    p.add_argument("--grad_accum",    type=int,   default=2,
+                   help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
     return p.parse_args()
 
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
+# ── Triplet-level F1 ─────────────────────────────────────────────────────────
 
-def compute_metrics(preds, labels):
+def normalize_triplet(t):
+    """Normalize a triplet dict for comparison."""
+    asp = t.get("Aspect", "NULL").strip().lower()
+    opn = t.get("Opinion", "NULL").strip().lower()
+    # For F1 we compare aspect+opinion (ignoring VA for span F1)
+    return (asp, opn)
+
+
+def compute_triplet_f1(pred_triplets_list, gold_triplets_list):
     """
-    Compute token-level metrics for span labels (ignores PAD_LABEL_ID=-100).
-    Returns overall accuracy, macro precision, recall, F1,
-    and per-class precision, recall, F1 for each BIO label.
+    Compute triplet-level precision, recall, F1.
+    pred_triplets_list: list of list of triplet dicts (one list per sentence)
+    gold_triplets_list: list of list of triplet dicts (one list per sentence)
     """
-    LABEL_NAMES = {0: "O", 1: "B-ASP", 2: "I-ASP", 3: "B-OPN", 4: "I-OPN"}
-    n_classes = len(LABEL_NAMES)
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
 
-    # Per-class TP, FP, FN
-    tp = [0] * n_classes
-    fp = [0] * n_classes
-    fn = [0] * n_classes
-    correct = total = 0
+    for preds, golds in zip(pred_triplets_list, gold_triplets_list):
+        pred_set = Counter([normalize_triplet(t) for t in preds])
+        gold_set = Counter([normalize_triplet(t) for t in golds])
 
-    for p_seq, l_seq in zip(preds, labels):
-        for pi, li in zip(p_seq, l_seq):
-            if li == PAD_LABEL_ID:
-                continue
-            total += 1
-            if pi == li:
-                correct += 1
-                tp[pi] += 1
+        # TP: min of pred and gold counts for each triplet
+        for triplet in pred_set:
+            if triplet in gold_set:
+                tp = min(pred_set[triplet], gold_set[triplet])
+                total_tp += tp
+                total_fp += pred_set[triplet] - tp
             else:
-                fp[pi] += 1
-                fn[li] += 1
+                total_fp += pred_set[triplet]
 
-    accuracy = correct / (total + 1e-9)
+        for triplet in gold_set:
+            if triplet in pred_set:
+                total_fn += max(0, gold_set[triplet] - pred_set[triplet])
+            else:
+                total_fn += gold_set[triplet]
 
-    per_class = {}
-    for c in range(n_classes):
-        p  = tp[c] / (tp[c] + fp[c] + 1e-9)
-        r  = tp[c] / (tp[c] + fn[c] + 1e-9)
-        f1 = 2 * p * r / (p + r + 1e-9)
-        per_class[LABEL_NAMES[c]] = {"precision": p, "recall": r, "f1": f1,
-                                      "support": tp[c] + fn[c]}
+    precision = total_tp / (total_tp + total_fp + 1e-9)
+    recall    = total_tp / (total_tp + total_fn + 1e-9)
+    f1        = 2 * precision * recall / (precision + recall + 1e-9)
 
-    # Macro averages (span labels only, exclude O)
-    span_classes = ["B-ASP", "I-ASP", "B-OPN", "I-OPN"]
-    macro_prec = sum(per_class[c]["precision"] for c in span_classes) / len(span_classes)
-    macro_rec  = sum(per_class[c]["recall"]    for c in span_classes) / len(span_classes)
-    macro_f1   = sum(per_class[c]["f1"]        for c in span_classes) / len(span_classes)
-
-    return {
-        "accuracy":   accuracy,
-        "precision":  macro_prec,
-        "recall":     macro_rec,
-        "f1":         macro_f1,
-        "per_class":  per_class,
-    }
+    return {"precision": precision, "recall": recall, "f1": f1,
+            "tp": total_tp, "fp": total_fp, "fn": total_fn}
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
-def train_epoch(model, loader, criterion, optimizer, scheduler, device, scaler):
+def train_epoch(model, loader, optimizer, scheduler, device, scaler, grad_accum_steps):
     model.train()
-    total_loss = span_loss_sum = va_loss_sum = 0
-    all_preds, all_labels = [], []
+    total_loss = 0
+    num_batches = 0
+    optimizer.zero_grad()
 
-    for batch in tqdm(loader, desc="  train", leave=False):
+    for step, batch in enumerate(tqdm(loader, desc="  train", leave=False)):
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        adj            = batch["adj"].to(device)
-        span_labels    = batch["span_labels"].to(device)
-        valence        = batch["valence"].to(device)
-        arousal        = batch["arousal"].to(device)
+        labels         = batch["labels"].to(device)
 
+        with torch.amp.autocast('cpu'):
+            outputs = model.forward(input_ids, attention_mask, labels=labels)
+            loss = outputs.loss / grad_accum_steps
+
+        loss.backward()
+        total_loss += outputs.loss.item()
+        num_batches += 1
+
+        if (step + 1) % grad_accum_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+    # Handle remaining gradients
+    if num_batches % grad_accum_steps != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast():
-            span_logits, va_pred = model(input_ids, attention_mask, adj)
-            loss, sl, vl = criterion(span_logits, va_pred, span_labels, valence, arousal)
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
-
-        total_loss    += loss.item()
-        span_loss_sum += sl.item()
-        va_loss_sum   += vl.item()
-
-        preds = span_logits.argmax(-1).cpu().tolist()
-        lbls  = span_labels.cpu().tolist()
-        all_preds.extend(preds)
-        all_labels.extend(lbls)
-
-    n = len(loader)
-    m = compute_metrics(all_preds, all_labels)
-    return {
-        "loss":      total_loss / n,
-        "span_loss": span_loss_sum / n,
-        "va_loss":   va_loss_sum / n,
-        "accuracy":  m["accuracy"],
-        "precision": m["precision"],
-        "recall":    m["recall"],
-        "f1":        m["f1"],
-        "per_class": m["per_class"],
-    }
+    return {"loss": total_loss / max(num_batches, 1)}
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, criterion, device):
+def eval_epoch(model, loader, device, tokenizer, num_beams=4):
     model.eval()
-    total_loss = span_loss_sum = va_loss_sum = 0
-    va_preds, va_targets = [], []
-    all_preds, all_labels = [], []
+    total_loss = 0
+    num_batches = 0
+
+    all_pred_triplets = []
+    all_gold_triplets = []
 
     for batch in tqdm(loader, desc="  val  ", leave=False):
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        adj            = batch["adj"].to(device)
-        span_labels    = batch["span_labels"].to(device)
-        valence        = batch["valence"].to(device)
-        arousal        = batch["arousal"].to(device)
+        labels         = batch["labels"].to(device)
 
-        with torch.cuda.amp.autocast():
-            span_logits, va_pred = model(input_ids, attention_mask, adj)
-            loss, sl, vl = criterion(span_logits, va_pred, span_labels, valence, arousal)
+        # Compute loss
+        outputs = model.forward(input_ids, attention_mask, labels=labels)
+        total_loss += outputs.loss.item()
+        num_batches += 1
 
-        total_loss    += loss.item()
-        span_loss_sum += sl.item()
-        va_loss_sum   += vl.item()
+        # Generate predictions
+        gen_ids = model.generate(input_ids, attention_mask, num_beams=num_beams)
+        pred_texts = model.batch_decode(gen_ids)
 
-        preds = span_logits.argmax(-1).cpu().tolist()
-        lbls  = span_labels.cpu().tolist()
-        all_preds.extend(preds)
-        all_labels.extend(lbls)
+        # Decode gold
+        gold_labels = labels.clone()
+        gold_labels[gold_labels == -100] = tokenizer.pad_token_id
+        gold_texts = tokenizer.batch_decode(gold_labels, skip_special_tokens=True)
 
-        va_preds.extend(va_pred.cpu().tolist())
-        va_tgt = torch.stack([valence, arousal], dim=1).cpu().tolist()
-        va_targets.extend(va_tgt)
+        for pred_text, gold_text in zip(pred_texts, gold_texts):
+            pred_trips = parse_triplets(pred_text)
+            gold_trips = parse_triplets(gold_text)
+            all_pred_triplets.append(pred_trips)
+            all_gold_triplets.append(gold_trips)
 
-    n = len(loader)
-    m = compute_metrics(all_preds, all_labels)
+    metrics = compute_triplet_f1(all_pred_triplets, all_gold_triplets)
+    metrics["loss"] = total_loss / max(num_batches, 1)
 
-    import numpy as np
-    va_preds   = np.array(va_preds)
-    va_targets = np.array(va_targets)
-    val_mae    = float(np.abs(va_preds[:, 0] - va_targets[:, 0]).mean())
-    aro_mae    = float(np.abs(va_preds[:, 1] - va_targets[:, 1]).mean())
-
-    return {
-        "loss":      total_loss / n,
-        "span_loss": span_loss_sum / n,
-        "va_loss":   va_loss_sum / n,
-        "accuracy":  m["accuracy"],
-        "precision": m["precision"],
-        "recall":    m["recall"],
-        "f1":        m["f1"],
-        "per_class": m["per_class"],
-        "val_mae":   val_mae,
-        "aro_mae":   aro_mae,
-    }
+    return metrics, all_pred_triplets, all_gold_triplets
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -226,78 +190,78 @@ def main():
         tokenizer_name=args.encoder,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        use_dep_graph=not args.no_dep_graph,
     )
     print(f"  Train: {len(train_loader.dataset):,} | Val: {len(val_loader.dataset):,}")
 
-    # Model & loss
-    model = ASTEModel(
-        encoder_name=args.encoder,
-        gcn_layers=args.gcn_layers,
-    ).to(device)
+    # Model
+    print(f"Loading model: {args.encoder}")
+    model = ASTEModel(model_name=args.encoder)
+    model.to(device)
+    tokenizer = model.tokenizer
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Upweight B/I span labels — O is ~81% of tokens, causing near-zero span F1
-    criterion = ASTELoss(
-        lambda_span=args.lambda_span,
-        lambda_va=args.lambda_va,
-        span_class_weights=[1.0, 5.0, 4.0, 5.0, 4.0],
-    )
-    criterion.ce_loss.weight = criterion.ce_loss.weight.to(device)
+    # Optimizer
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
-    # Optimiser — lower LR for encoder, higher for new heads
-    encoder_params = list(model.encoder.parameters())
-    head_params    = [p for p in model.parameters()
-                      if not any(p is ep for ep in encoder_params)]
-    optimizer = AdamW([
-        {"params": encoder_params, "lr": args.lr},
-        {"params": head_params,    "lr": args.lr * 10},
-    ], weight_decay=0.01)
-
-    total_steps  = len(train_loader) * args.epochs
+    total_steps  = (len(train_loader) // args.grad_accum) * args.epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
-    scheduler    = get_linear_schedule_with_warmup(
+    scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps,
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = None  # No AMP on CPU
 
     # Training
     best_val_f1  = 0.0
     history      = []
+    patience_counter = 0
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         print(f"\nEpoch {epoch}/{args.epochs}")
 
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, scaler)
-        val_metrics   = eval_epoch(model, val_loader, criterion, device)
+        train_metrics = train_epoch(
+            model, train_loader, optimizer, scheduler, device, scaler, args.grad_accum
+        )
+
+        val_metrics, pred_trips, gold_trips = eval_epoch(
+            model, val_loader, device, tokenizer, num_beams=args.num_beams
+        )
 
         elapsed = time.time() - t0
-        print(f"  {'Metric':<12} {'Train':>8} {'Val':>8}")
-        print(f"  {'-'*30}")
-        print(f"  {'Loss':<12} {train_metrics['loss']:>8.4f} {val_metrics['loss']:>8.4f}")
-        print(f"  {'Accuracy':<12} {train_metrics['accuracy']:>8.4f} {val_metrics['accuracy']:>8.4f}")
-        print(f"  {'Precision':<12} {train_metrics['precision']:>8.4f} {val_metrics['precision']:>8.4f}")
-        print(f"  {'Recall':<12} {train_metrics['recall']:>8.4f} {val_metrics['recall']:>8.4f}")
-        print(f"  {'F1 (macro)':<12} {train_metrics['f1']:>8.4f} {val_metrics['f1']:>8.4f}")
-        print(f"  {'Val V-MAE':<12} {'':>8} {val_metrics['val_mae']:>8.3f}")
-        print(f"  {'Val A-MAE':<12} {'':>8} {val_metrics['aro_mae']:>8.3f}")
-        print(f"  Per-class (val):")
-        for cls, s in val_metrics['per_class'].items():
-            print(f"    {cls:<10} P={s['precision']:.3f}  R={s['recall']:.3f}  F1={s['f1']:.3f}  support={s['support']}")
+        print(f"  {'Metric':<14} {'Train':>8} {'Val':>8}")
+        print(f"  {'-'*32}")
+        print(f"  {'Loss':<14} {train_metrics['loss']:>8.4f} {val_metrics['loss']:>8.4f}")
+        print(f"  {'Precision':<14} {'':>8} {val_metrics['precision']:>8.4f}")
+        print(f"  {'Recall':<14} {'':>8} {val_metrics['recall']:>8.4f}")
+        print(f"  {'F1 (triplet)':<14} {'':>8} {val_metrics['f1']:>8.4f}")
+        print(f"  {'TP/FP/FN':<14} {'':>8} {val_metrics['tp']}/{val_metrics['fp']}/{val_metrics['fn']}")
+
+        # Show some predictions
+        print(f"  Sample predictions:")
+        for i in range(min(3, len(pred_trips))):
+            print(f"    Pred: {pred_trips[i]}")
+            print(f"    Gold: {gold_trips[i]}")
+            print()
+
         print(f"  Time: {elapsed:.0f}s")
 
-        skip = {"per_class"}
-        row = {"epoch": epoch,
-               **{f"train_{k}": v for k, v in train_metrics.items() if k not in skip},
-               **{f"val_{k}": v for k, v in val_metrics.items() if k not in skip}}
+        row = {
+            "epoch": epoch,
+            "train_loss": train_metrics["loss"],
+            "val_loss": val_metrics["loss"],
+            "val_precision": val_metrics["precision"],
+            "val_recall": val_metrics["recall"],
+            "val_f1": val_metrics["f1"],
+        }
         history.append(row)
 
         # Save best
         if val_metrics["f1"] > best_val_f1:
             best_val_f1 = val_metrics["f1"]
+            patience_counter = 0
             ckpt = os.path.join(args.output_dir, "best_model.pt")
             torch.save({
                 "epoch":       epoch,
@@ -306,11 +270,17 @@ def main():
                 "args":        vars(args),
             }, ckpt)
             print(f"  ✓ New best val F1={best_val_f1:.4f} — saved to {ckpt}")
+        else:
+            patience_counter += 1
+            print(f"  No improvement. Patience: {patience_counter}/{args.patience}")
+            if patience_counter >= args.patience:
+                print(f"  Early stopping at epoch {epoch}")
+                break
 
     # Save history
     with open(os.path.join(args.output_dir, "history.json"), "w") as f:
         json.dump(history, f, indent=2)
-    print(f"\nDone. Best val span F1: {best_val_f1:.4f}")
+    print(f"\nDone. Best val triplet F1: {best_val_f1:.4f}")
 
 
 if __name__ == "__main__":
